@@ -46,7 +46,8 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.loaders import AttnProcsLayers
-# from oft_utils.attention_processor import OFTAttnProcessor
+from oft_utils.attention_processor import OFTAttnProcessor
+from oft_utils.attention_processor import StiefelAttnProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -414,9 +415,6 @@ def parse_args(input_args=None):
             "The constrainted variant of OFT."
         )
     )
-    parser.add_argument("--kron", action='store_true', default=False, help="Whether to use kron product for orthogonal matrix.")
-    parser.add_argument("--kron_reverse", action='store_true', default=False)
-    parser.add_argument("--block_share", action='store_true', default=False)
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -733,11 +731,6 @@ def main(args):
     # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
     # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
     # => 32 layers
-    
-    if args.kron:
-        from oft_utils.attention_processor import KronOFTAttnProcessor as OFTAttnProcessor
-    else:
-        from oft_utils.attention_processor import OFTAttnProcessor
 
     # Set correct oft layers
     oft_attn_procs = {}
@@ -752,7 +745,7 @@ def main(args):
             block_id = int(name[len("down_blocks.")])
             hidden_size = unet.config.block_out_channels[block_id]
 
-        oft_attn_procs[name] = OFTAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, eps=args.eps, r=args.r, is_coft=args.coft, block_share=args.block_share, kron_reverse=args.kron_reverse)
+        oft_attn_procs[name] = StiefelAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, eps=args.eps, r=args.r, is_coft=args.coft)
 
     unet.set_attn_processor(oft_attn_procs)
     oft_layers = AttnProcsLayers(unet.attn_processors)
@@ -780,16 +773,34 @@ def main(args):
 
         optimizer_class = bnb.optim.AdamW8bit
     else:
-        optimizer_class = torch.optim.AdamW
+        # optimizer_class = torch.optim.AdamW
+        # optimizer_class = torch.optim.Adam
+        pass
 
-    # Optimizer creation
-    optimizer = optimizer_class(
+    # reinit R as identity
+    for p in oft_layers.parameters():
+        torch.nn.init.eye_(p)  # hardcoded for [1, M, M] matrix with r=1
+        # print(p.shape)
+
+    # replace with stiefel optimizer
+    from StiefelOptimizers import StiefelAdam
+    optimizer = StiefelAdam(
         oft_layers.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        # weight_decay=args.adam_weight_decay,
+        # eps=args.adam_epsilon,
     )
+    # breakpoint()
+
+    # Optimizer creation
+    # optimizer = optimizer_class(
+    #     oft_layers.parameters(),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(

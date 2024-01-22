@@ -469,7 +469,7 @@ class OFTLinearLayer(nn.Module):
                 with torch.no_grad():
                     self.R.copy_(project_batch(self.R, eps=self.eps))
             orth_rotate = self.cayley_batch(self.R)
-
+        
         # Block-diagonal parametrization
         block_diagonal_matrix = self.block_diagonal(orth_rotate)
 
@@ -478,7 +478,7 @@ class OFTLinearLayer(nn.Module):
         fix_filt = torch.transpose(fix_filt, 0, 1)
         filt = torch.mm(block_diagonal_matrix, fix_filt.to(dtype))
         filt = torch.transpose(filt, 0, 1)
- 
+
         # Apply the trainable identity matrix
         bias_term = attn.bias.data if attn.bias is not None else None
         if bias_term is not None:
@@ -540,7 +540,7 @@ class OFTLinearLayer(nn.Module):
 
 
 class OFTAttnProcessor(nn.Module):
-    def __init__(self, hidden_size, cross_attention_dim=None, eps=2e-5, r=4, is_coft=False):
+    def __init__(self, hidden_size, cross_attention_dim=None, eps=2e-5, r=4, is_coft=False, block_share=False, **kwargs):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -548,10 +548,10 @@ class OFTAttnProcessor(nn.Module):
         self.r = r
         self.is_coft = is_coft
         
-        self.to_q_oft = OFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
-        self.to_k_oft = OFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
-        self.to_v_oft = OFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
-        self.to_out_oft = OFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
+        self.to_q_oft = OFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, block_share=block_share)
+        self.to_k_oft = OFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, block_share=block_share)
+        self.to_v_oft = OFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, block_share=block_share)
+        self.to_out_oft = OFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, block_share=block_share)
 
     def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, scale=1.0):
         batch_size, sequence_length, _ = (
@@ -904,6 +904,351 @@ class SlicedAttnAddedKVProcessor:
 
         hidden_states = hidden_states.transpose(-1, -2).reshape(residual.shape)
         hidden_states = hidden_states + residual
+
+        return hidden_states
+
+
+class StiefelLinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, block_share=False, eps=6e-5, r=4, is_coft=False):
+        super(StiefelLinearLayer, self).__init__()
+
+        # Define the reduction rate:
+        self.r = r
+        
+        # Check whether to use the constrained variant COFT 
+        self.is_coft = is_coft
+
+        assert in_features % self.r == 0, "in_features must be divisible by r"
+
+        # Get the number of available GPUs
+        # self.num_gpus = torch.cuda.device_count()
+        # Set the device IDs for distributed training
+        # self.device_ids = list(range(self.num_gpus))
+
+        self.in_features=in_features
+        self.out_features=out_features
+
+        self.register_buffer('cross_attention_dim', torch.tensor(in_features))
+        self.register_buffer('hidden_size', torch.tensor(out_features))
+        
+        # Define the fixed Linear layer: v
+        # self.OFT = torch.nn.Linear(in_features=in_features, out_features=out_features, bias=bias)
+
+        #self.filt_shape = [in_features, in_features]
+        self.fix_filt_shape = [in_features, out_features]
+
+        self.block_share = block_share
+        # Define the trainable matrix parameter: R
+        if self.block_share:
+            # Initialized as an identity matrix
+            self.R_shape = [in_features // self.r, in_features // self.r]
+            self.R = nn.Parameter(torch.zeros(self.R_shape[0], self.R_shape[0]), requires_grad=True)
+  
+            self.eps = eps * self.R_shape[0] * self.R_shape[0]
+        else:
+            # Initialized as an identity matrix
+            self.R_shape = [self.r, in_features // self.r, in_features // self.r]
+            R = torch.zeros(self.R_shape[1], self.R_shape[1])
+            R = torch.stack([R] * self.r)
+            # self.R = nn.Parameter(R, requires_grad=True)
+            self.R = nn.ParameterList([nn.Parameter(R[i, ...], requires_grad=True) for i in range(self.r)])
+            self.eps = eps * self.R_shape[1] * self.R_shape[1]
+
+    def forward(self, attn, x):
+        orig_dtype = x.dtype
+        dtype = self.R[0].dtype
+
+        # if self.block_share:
+        #     if self.is_coft:
+        #         with torch.no_grad():
+        #             self.R.copy_(project(self.R, eps=self.eps))
+        #     orth_rotate = self.cayley(self.R)
+        # else:
+        #     if self.is_coft:
+        #         with torch.no_grad():
+        #             self.R.copy_(project_batch(self.R, eps=self.eps))
+        #     orth_rotate = self.cayley_batch(self.R)
+        
+        orth_rotate = torch.stack([self.R[i] for i in range(self.r)])
+        
+        # Block-diagonal parametrization
+        block_diagonal_matrix = self.block_diagonal(orth_rotate)
+
+        # fix filter
+        fix_filt = attn.weight.data
+        fix_filt = torch.transpose(fix_filt, 0, 1)
+        filt = torch.mm(block_diagonal_matrix, fix_filt.to(dtype))
+        filt = torch.transpose(filt, 0, 1)
+
+        # Apply the trainable identity matrix
+        bias_term = attn.bias.data if attn.bias is not None else None
+        if bias_term is not None:
+            bias_term = bias_term.to(orig_dtype)
+
+        out = nn.functional.linear(input=x.to(orig_dtype), weight=filt.to(orig_dtype), bias=bias_term)
+        # out = nn.functional.linear(input=x, weight=fix_filt.transpose(0, 1), bias=bias_term)
+
+        return out
+
+    def block_diagonal(self, R):
+        if len(R.shape) == 2:
+            # Create a list of R repeated block_count times
+            blocks = [R] * self.r
+        else:
+            # Create a list of R slices along the third dimension
+            blocks = [R[i, ...] for i in range(self.r)]
+
+        # Use torch.block_diag to create the block diagonal matrix
+        A = torch.block_diag(*blocks)
+
+        return A
+
+    # def is_orthogonal(self, R, eps=1e-5):
+    #     with torch.no_grad():
+    #         RtR = torch.matmul(R.t(), R)
+    #         diff = torch.abs(RtR - torch.eye(R.shape[1], dtype=R.dtype, device=R.device))
+    #         return torch.all(diff < eps)
+
+    # def is_identity_matrix(self, tensor):
+    #     if not torch.is_tensor(tensor):
+    #         raise TypeError("Input must be a PyTorch tensor.")
+    #     if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
+    #         return False
+    #     identity = torch.eye(tensor.shape[0], device=tensor.device)
+    #     return torch.all(torch.eq(tensor, identity))
+
+
+class StiefelAttnProcessor(nn.Module):
+    def __init__(self, hidden_size, cross_attention_dim=None, eps=2e-5, r=4, is_coft=False):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.r = r
+        self.is_coft = is_coft
+        
+        self.to_q_oft = StiefelLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
+        self.to_k_oft = StiefelLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
+        self.to_v_oft = StiefelLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
+        self.to_out_oft = StiefelLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft)
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, scale=1.0):
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        # query = attn.to_q(hidden_states) + scale * self.to_q_lora(hidden_states)
+        
+        query = self.to_q_oft(attn.to_q, hidden_states)
+        query = attn.head_to_batch_dim(query)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # key = attn.to_k(encoder_hidden_states) + scale * self.to_k_lora(encoder_hidden_states)
+        key = self.to_k_oft(attn.to_k, encoder_hidden_states)
+        # value = attn.to_v(encoder_hidden_states) + scale * self.to_v_lora(encoder_hidden_states)
+        value = self.to_v_oft(attn.to_v, encoder_hidden_states)
+
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        # hidden_states = attn.to_out[0](hidden_states) + scale * self.to_out_lora(hidden_states)
+        hidden_states = self.to_out_oft(attn.to_out[0], hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+
+
+class KronOFTLinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, block_share=False, eps=6e-5, r=4, is_coft=False, kron_reverse=False):
+        super(KronOFTLinearLayer, self).__init__()
+
+        # Define the reduction rate:
+        self.r = r
+        
+        # Check whether to use the constrained variant COFT 
+        self.is_coft = is_coft
+
+        assert in_features % self.r == 0, "in_features must be divisible by r"
+
+        # Get the number of available GPUs
+        # self.num_gpus = torch.cuda.device_count()
+        # Set the device IDs for distributed training
+        # self.device_ids = list(range(self.num_gpus))
+
+        self.in_features=in_features
+        self.out_features=out_features
+
+        self.register_buffer('cross_attention_dim', torch.tensor(in_features))
+        self.register_buffer('hidden_size', torch.tensor(out_features))
+        
+        # Define the fixed Linear layer: v
+        # self.OFT = torch.nn.Linear(in_features=in_features, out_features=out_features, bias=bias)
+
+        #self.filt_shape = [in_features, in_features]
+        self.fix_filt_shape = [in_features, out_features]
+
+        self.block_share = block_share
+        # Define the trainable matrix parameter: R
+        if self.block_share:
+            raise NotImplementedError  # KronOFT is essentially block-shared
+            # Initialized as an identity matrix
+            self.R_shape = [in_features // self.r, in_features // self.r]
+            self.R = nn.Parameter(torch.zeros(self.R_shape[0], self.R_shape[0]), requires_grad=True)
+  
+            self.eps = eps * self.R_shape[0] * self.R_shape[0]
+        else:
+            # Initialized as an identity matrix
+            self.R_shape = [in_features // self.r, in_features // self.r]
+            self.R = nn.Parameter(torch.zeros(self.R_shape[0], self.R_shape[0]), requires_grad=True)
+            self.K = nn.Parameter(torch.zeros(self.r, self.r), requires_grad=True)
+            self.eps = eps * self.R_shape[1] * self.R_shape[1]
+        
+        self.kron_reverse = kron_reverse
+
+    def forward(self, attn, x):
+        orig_dtype = x.dtype
+        dtype = self.R.dtype
+
+        if self.is_coft:
+            with torch.no_grad():
+                self.R.copy_(project(self.R, eps=self.eps))
+        orth_rotate = self.cayley(self.R)
+
+        with torch.no_grad():
+            self.K.copy_(project(self.K, eps=self.eps))
+        kron_rotate = self.cayley(self.K)
+        
+        # Block-diagonal parametrization
+        # block_diagonal_matrix = self.block_diagonal(orth_rotate)
+        if self.kron_reverse:
+            block_diagonal_matrix = torch.kron(orth_rotate, kron_rotate)
+        else:
+            block_diagonal_matrix = torch.kron(kron_rotate, orth_rotate)
+
+        # fix filter
+        fix_filt = attn.weight.data
+        fix_filt = torch.transpose(fix_filt, 0, 1)
+        filt = torch.mm(block_diagonal_matrix, fix_filt.to(dtype))
+        filt = torch.transpose(filt, 0, 1)
+
+        # Apply the trainable identity matrix
+        bias_term = attn.bias.data if attn.bias is not None else None
+        if bias_term is not None:
+            bias_term = bias_term.to(orig_dtype)
+
+        out = nn.functional.linear(input=x.to(orig_dtype), weight=filt.to(orig_dtype), bias=bias_term)
+        # out = nn.functional.linear(input=x, weight=fix_filt.transpose(0, 1), bias=bias_term)
+
+        return out
+
+    def cayley(self, data):
+        r, c = list(data.shape)
+        # Ensure the input matrix is skew-symmetric
+        skew = 0.5 * (data - data.t())
+        I = torch.eye(r, device=data.device)
+        # Perform the Cayley parametrization
+        Q = torch.mm(I - skew, torch.inverse(I + skew))
+
+        return Q
+    
+    def cayley_batch(self, data):
+        b, r, c = data.shape
+        # Ensure the input matrix is skew-symmetric
+        skew = 0.5 * (data - data.transpose(1, 2))
+        # I = torch.eye(r, device=data.device).unsqueeze(0).repeat(b, 1, 1)
+        I = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
+
+        # Perform the Cayley parametrization
+        Q = torch.bmm(I - skew, torch.inverse(I + skew))
+
+        return Q
+
+    def block_diagonal(self, R):
+        if len(R.shape) == 2:
+            # Create a list of R repeated block_count times
+            blocks = [R] * self.r
+        else:
+            # Create a list of R slices along the third dimension
+            blocks = [R[i, ...] for i in range(self.r)]
+
+        # Use torch.block_diag to create the block diagonal matrix
+        A = torch.block_diag(*blocks)
+
+        return A
+
+    def is_orthogonal(self, R, eps=1e-5):
+        with torch.no_grad():
+            RtR = torch.matmul(R.t(), R)
+            diff = torch.abs(RtR - torch.eye(R.shape[1], dtype=R.dtype, device=R.device))
+            return torch.all(diff < eps)
+
+    def is_identity_matrix(self, tensor):
+        if not torch.is_tensor(tensor):
+            raise TypeError("Input must be a PyTorch tensor.")
+        if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
+            return False
+        identity = torch.eye(tensor.shape[0], device=tensor.device)
+        return torch.all(torch.eq(tensor, identity))
+
+
+class KronOFTAttnProcessor(nn.Module):
+    def __init__(self, hidden_size, cross_attention_dim=None, eps=2e-5, r=4, is_coft=False, **kwargs):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.r = r
+        self.is_coft = is_coft
+        
+        self.to_q_oft = KronOFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, **kwargs)
+        self.to_k_oft = KronOFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, **kwargs)
+        self.to_v_oft = KronOFTLinearLayer(cross_attention_dim or hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, **kwargs)
+        self.to_out_oft = KronOFTLinearLayer(hidden_size, hidden_size, eps=eps, r=r, is_coft=is_coft, **kwargs)
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, scale=1.0):
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        # query = attn.to_q(hidden_states) + scale * self.to_q_lora(hidden_states)
+        
+        query = self.to_q_oft(attn.to_q, hidden_states)
+        query = attn.head_to_batch_dim(query)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # key = attn.to_k(encoder_hidden_states) + scale * self.to_k_lora(encoder_hidden_states)
+        key = self.to_k_oft(attn.to_k, encoder_hidden_states)
+        # value = attn.to_v(encoder_hidden_states) + scale * self.to_v_lora(encoder_hidden_states)
+        value = self.to_v_oft(attn.to_v, encoder_hidden_states)
+
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        # hidden_states = attn.to_out[0](hidden_states) + scale * self.to_out_lora(hidden_states)
+        hidden_states = self.to_out_oft(attn.to_out[0], hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
 
         return hidden_states
 
